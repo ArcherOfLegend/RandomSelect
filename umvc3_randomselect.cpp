@@ -28,20 +28,20 @@ static constexpr uintptr_t VOICE_SITE_2 = 0x14036603B;  // Random All
 uint64_t BattleSettingInstance = 0x140004700;
 uint64_t GameConfigInstance = 0x140001AB0;
 uint64_t GetSecret = 0x140004A30;
-uint64_t GetTeamMember = 0x14024CDB0;    
-uint64_t IsOwned = 0x140226670;          
+uint64_t GetTeamMember = 0x14024CDB0;    // (bs, side, member)
+uint64_t IsOwned = 0x140226670;          // (secret, id)
 uint64_t RngState = 0x1400046D0;
 uint64_t RngNext = 0x14000AF80;
 
-uint64_t NameTable = 0x140C553B0;        
-uint64_t UnlockTable = 0x140A6FD30;      
+uint64_t NameTable = 0x140C553B0;        // char*[60], "cmn", "Ryu", "Chunli"...
+uint64_t UnlockTable = 0x140A6FD30;      // byte per ID
 
 // Offsets
-static constexpr uintptr_t MenuState_offset = 0x2B4;     
+static constexpr uintptr_t MenuState_offset = 0x2B4;     // uMenuChrSel, int[2]
 
 static constexpr int VANILLA_COUNT = 60;
-static constexpr int VANILLA_MAX = 50;   
-static constexpr int CLONE_ID_BASE = 59; 
+static constexpr int VANILLA_MAX = 50;   // 51-59 are hidden
+static constexpr int CLONE_ID_BASE = 59; // [Character1] = 60
 
 typedef void*(__fastcall* GetInstance_t)();
 typedef uint32_t(__fastcall* RandomPick_t)(void*, uint32_t);
@@ -51,6 +51,8 @@ typedef uint32_t(__fastcall* VoiceLang_t)(void*, uint32_t);
 RandomPick_t oPick1 = nullptr, oPick2 = nullptr;
 RandomColor_t oColor1 = nullptr, oColor2 = nullptr;
 VoiceLang_t oVoice1 = nullptr, oVoice2 = nullptr;
+
+static bool PickedClone = false;
 
 struct CloneEntry
 {
@@ -188,6 +190,7 @@ void LoadConfig()
     RandomClones = GetPrivateProfileIntW(L"Random", L"IncludeClones", 1, iniPath.c_str()) != 0;
 }
 
+// Child = listed as someone's ChildN, or has no SoundID
 bool IsSelectableClone(const CloneEntry& c)
 {
     return !c.name.empty() && c.hasSound && ChildNames.count(Lower(c.name)) == 0;
@@ -204,20 +207,13 @@ const CloneEntry* FindClone(int id)
     return nullptr;
 }
 
-int BaseId(int id)
-{
-    const CloneEntry* c = FindClone(id);
-    if (!c) return id;
-    int baseId = VanillaId(c->baseName);
-    return baseId > 0 ? baseId : id;
-}
-
 uint32_t GameRandom()
 {
     uint32_t* state = ((uint32_t*(__fastcall*)())RngState)();
     return ((uint32_t(__fastcall*)(uint32_t*))RngNext)(state);
 }
 
+// Same unlock + owned check vanilla random uses
 bool IsAvailable(int id)
 {
     if (id < 1 || id >= VANILLA_COUNT) return false;
@@ -266,11 +262,13 @@ uint32_t RandomPick(void* menu, uint32_t player, RandomPick_t original)
         }
     }
 
+    PickedClone = false;
     if (pool.empty())
         return original(menu, player);
 
     int id = pool[GameRandom() % pool.size()];
     const CloneEntry* c = FindClone(id);
+    PickedClone = id > CLONE_ID_BASE;
     Log("[RandomSelect] P%u -> %s (%d), pool %d\n", player + 1, c ? c->name.c_str() : VanillaName(id), id, (int)pool.size());
     return id;
 }
@@ -283,12 +281,26 @@ uint32_t RandomColor(void* menu, uint32_t player, uint32_t id, RandomColor_t ori
     return GameRandom() % colors;
 }
 
+// Voice lang check
+uint32_t VoiceLang(void* cfg, uint32_t id, VoiceLang_t original)
+{
+    bool clone = PickedClone || (int)id > CLONE_ID_BASE;
+    PickedClone = false;
+    if (clone)
+    {
+        Log("[RandomSelect] clone picked, forcing english voice\n");
+        return 1;
+    }
+    return original(cfg, id);
+}
+
+uint32_t __fastcall HookedVoice1(void* cfg, uint32_t id) { return VoiceLang(cfg, id, oVoice1); }
+uint32_t __fastcall HookedVoice2(void* cfg, uint32_t id) { return VoiceLang(cfg, id, oVoice2); }
+
 uint32_t __fastcall HookedPick1(void* menu, uint32_t player) { return RandomPick(menu, player, oPick1); }
 uint32_t __fastcall HookedPick2(void* menu, uint32_t player) { return RandomPick(menu, player, oPick2); }
 uint32_t __fastcall HookedColor1(void* menu, uint32_t player, uint32_t id) { return RandomColor(menu, player, id, oColor1); }
 uint32_t __fastcall HookedColor2(void* menu, uint32_t player, uint32_t id) { return RandomColor(menu, player, id, oColor2); }
-uint32_t __fastcall HookedVoice1(void* cfg, uint32_t id) { return oVoice1(cfg, BaseId(id)); }  // over 25 is forced english
-uint32_t __fastcall HookedVoice2(void* cfg, uint32_t id) { return oVoice2(cfg, BaseId(id)); }
 
 void OnInitializeHook()
 {
@@ -301,6 +313,8 @@ void OnInitializeHook()
     ReadCall(COLOR_SITE_2, oColor2);
     ReadCall(VOICE_SITE_1, oVoice1);
     ReadCall(VOICE_SITE_2, oVoice2);
+
+    // Default trampoline only fits one jump
     Trampoline* tramp = Trampoline::MakeTrampoline(GetModuleHandle(nullptr), 8 * 14, 1);
     InjectHook(PICK_SITE_1, tramp->Jump(HookedPick1), HookType::Call);
     InjectHook(PICK_SITE_2, tramp->Jump(HookedPick2), HookType::Call);
